@@ -13,6 +13,7 @@ pub enum Icon {
     Settings,
     TextScan,
     Edit,
+    Annotate,
     Close,
 }
 
@@ -32,6 +33,7 @@ impl Icon {
             Icon::Settings => settings(painter, center, size, color),
             Icon::TextScan => text_scan(painter, center, size, color),
             Icon::Edit => edit(painter, center, size, color),
+            Icon::Annotate => annotate(painter, center, size, color),
             Icon::Close => close(painter, center, size, color),
         }
     }
@@ -214,6 +216,37 @@ fn edit(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     painter.add(egui::Shape::line_segment(
         [head - perp * half_w, tip],
         egui::Stroke::new(w, color),
+    ));
+}
+
+/// 注释：圆角画框内一支指向右上角的箭头。
+fn annotate(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    let s = size;
+    let w = stroke_of(s);
+    // 画框：居中的圆角矩形轮廓。
+    let half = 0.33 * s;
+    let frame = egui::Rect::from_min_max(
+        egui::pos2(center.x - half, center.y - half),
+        egui::pos2(center.x + half, center.y + half),
+    );
+    painter.add(egui::Shape::rect_stroke(
+        frame,
+        CornerRadius::from(0.08 * s),
+        Stroke::new(w, color),
+        egui::StrokeKind::Middle,
+    ));
+    // 箭头：左下指向右上，尖端两条短边收成箭头。
+    let tail = egui::pos2(center.x - 0.16 * s, center.y + 0.16 * s);
+    let tip = egui::pos2(center.x + 0.14 * s, center.y - 0.14 * s);
+    painter.add(egui::Shape::line_segment([tail, tip], Stroke::new(w, color)));
+    let leg = 0.10 * s;
+    painter.add(egui::Shape::line_segment(
+        [tip, egui::pos2(tip.x - leg, tip.y)],
+        Stroke::new(w, color),
+    ));
+    painter.add(egui::Shape::line_segment(
+        [tip, egui::pos2(tip.x, tip.y + leg)],
+        Stroke::new(w, color),
     ));
 }
 

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use image::RgbaImage;
 
+use crate::annotation;
 use crate::editor::{self, EditState};
 use crate::gallery;
 use crate::geometry;
@@ -150,6 +151,20 @@ pub struct PhotoViewer {
     pending_open: Option<PathBuf>,
     /// 目录扫描线程回传的结果：(图片列表, 目标图片下标)。
     open_rx: Option<Receiver<Result<(Vec<PathBuf>, usize), String>>>,
+    /// 注释面板是否打开。
+    anno_open: bool,
+    /// 当前注释形状：Some 表示处于注释模式，等待一次绘制。
+    anno_shape: Option<annotation::Shape>,
+    /// 注释颜色。
+    anno_color: annotation::Color,
+    /// 注释粗细：占图片短边的百分比。
+    anno_width: f32,
+    /// 当前图片的注释列表。
+    annotations: Vec<annotation::Annotation>,
+    /// 正在拖拽的注释：起点与终点（归一化坐标）。
+    anno_drag: Option<(egui::Vec2, egui::Vec2)>,
+    /// 待确认的换图请求：存在时换图被推迟，等用户点「确定」。
+    pending_switch: Option<SwitchIntent>,
 }
 
 /// 按下位置所在的边缘区域。
@@ -158,6 +173,15 @@ enum Edge {
     None,
     Left,
     Right,
+}
+
+/// 待确认的换图请求：确认后才真正执行。
+#[derive(Clone)]
+enum SwitchIntent {
+    /// 前后切换若干张。
+    Step(i32),
+    /// 打开指定图片。
+    Open(PathBuf),
 }
 
 impl PhotoViewer {
@@ -224,6 +248,13 @@ impl PhotoViewer {
             frames: 0,
             pending_open: None,
             open_rx: None,
+            anno_open: false,
+            anno_shape: None,
+            anno_color: annotation::Color::Blue,
+            anno_width: 1.0,
+            annotations: Vec::new(),
+            anno_drag: None,
+            pending_switch: None,
         }
     }
 
@@ -257,6 +288,10 @@ impl PhotoViewer {
         // 识别进行中拒绝换图，避免结果与当前图片错位。
         if self.ocr_running {
             eprintln!("[open] 识别进行中，忽略打开请求");
+            return;
+        }
+        // 换图前先处理未保存的注释：有注释时按设置自动保存或推迟等确认。
+        if !self.prepare_switch(SwitchIntent::Open(path.to_path_buf())) {
             return;
         }
         // 换图前先处理未保存的编辑。
@@ -381,6 +416,8 @@ impl PhotoViewer {
         self.edit = EditState::default();
         self.preview = None;
         self.edit_token += 1;
+        // 换图后注释清空：注释只属于当前图片。
+        self.clear_annotations();
         self.restore_ocr_boxes();
         self.loader.load(self.token, self.content_version, path);
         self.prefetch_neighbors();
@@ -579,13 +616,95 @@ impl PhotoViewer {
         }
     }
 
-    /// 收起浮动窗口：设置与编辑面板在换图时关闭。
+    /// 收起浮动窗口：设置、编辑与注释面板在换图时关闭。
     fn close_panels(&mut self) {
-        if self.settings_open || self.edit_open {
-            eprintln!("[ui] 换图，自动关闭设置与编辑窗口");
+        if self.settings_open || self.edit_open || self.anno_open {
+            eprintln!("[ui] 换图，自动关闭设置、编辑与注释窗口");
         }
         self.settings_open = false;
         self.edit_open = false;
+        self.anno_open = false;
+        self.anno_shape = None;
+    }
+
+    /// 清空当前图片的注释，并退出注释模式。
+    fn clear_annotations(&mut self) {
+        if !self.annotations.is_empty() {
+            eprintln!("[anno] 清空 {} 条注释", self.annotations.len());
+        }
+        self.annotations.clear();
+        self.anno_shape = None;
+        self.anno_drag = None;
+    }
+
+    /// 换图前的注释处理：无注释直接放行，开启自动保存则先保存，否则推迟等确认。
+    ///
+    /// 返回 false 表示换图被推迟，换图请求已记在 `pending_switch` 里。
+    fn prepare_switch(&mut self, intent: SwitchIntent) -> bool {
+        if self.annotations.is_empty() {
+            return true;
+        }
+        if self.settings.auto_save_annotation {
+            eprintln!("[anno] 自动保存开启，换图前保存注释");
+            self.save_annotations();
+            // 保存成功时注释列表已清空；失败时仍需用户确认。
+            if self.annotations.is_empty() {
+                return true;
+            }
+        }
+        eprintln!("[anno] 存在未保存的注释，换图推迟等待确认");
+        self.pending_switch = Some(intent);
+        false
+    }
+
+    /// 保存注释并覆盖原图：底图取当前编辑结果，注释就地绘制后写盘。
+    fn save_annotations(&mut self) {
+        perf_scope!("保存注释");
+        if self.annotations.is_empty() {
+            self.status = Some("没有需要保存的注释".to_string());
+            return;
+        }
+        let Some(path) = self.gallery.get(self.index).cloned() else {
+            return;
+        };
+        let Some(source) = self.source.clone() else {
+            return;
+        };
+        // 底图用编辑后的结果，保证写回文件的内容与屏幕一致。
+        let mut composed = self.edit.apply(source.as_ref());
+        if self.edit.is_modified() {
+            eprintln!("[anno] 保存注释时一并写入未保存的编辑");
+        }
+        annotation::draw_on_image(&mut composed, &self.annotations);
+        match editor::save_overwrite(&path, &composed) {
+            Ok(()) => {
+                eprintln!(
+                    "[anno] 已覆盖保存 {} ({}x{})",
+                    path.display(),
+                    composed.width(),
+                    composed.height()
+                );
+                let composed = Arc::new(composed);
+                self.source = Some(composed.clone());
+                self.preview = None;
+                self.edit = EditState::default();
+                self.source_id += 1;
+                self.edit_token += 1;
+                self.content_size = [composed.width() as usize, composed.height() as usize];
+                // 原文件已改写，缓存里的旧图必须失效。
+                self.loader.invalidate(&path);
+                self.set_display(composed);
+                self.clear_ocr();
+                // 注释已经写进文件，列表清空。
+                self.annotations.clear();
+                self.anno_drag = None;
+                self.status = Some("已保存注释并覆盖原图".to_string());
+            }
+            Err(err) => {
+                eprintln!("[anno] 保存失败: {err}");
+                self.status = Some(err);
+            }
+        }
     }
 
     /// 前后切换同目录图片：到首尾就停住，不循环。
@@ -600,6 +719,10 @@ impl PhotoViewer {
             return;
         }
         let len = self.gallery.len() as i32;
+        // 换图前先处理未保存的注释：有注释时按设置自动保存或推迟等确认。
+        if !self.prepare_switch(SwitchIntent::Step(delta)) {
+            return;
+        }
         // 换图前先处理未保存的编辑。
         self.finish_edits();
         // 首尾不循环：越界就停在边界上。
@@ -1089,6 +1212,7 @@ impl PhotoViewer {
             if self.loading {
                 ctx.request_repaint_after(POLL_INTERVAL);
             }
+            // 画面为空时只处理指针：这里没有内容尺寸，不会发纹理请求。
             self.handle_pointer(ctx, &response, view);
             return;
         };
@@ -1144,6 +1268,9 @@ impl PhotoViewer {
             }
         }
         self.draw_ocr_boxes(ui.painter(), rect, display_size);
+        // 注释画在 OCR 框之上，避免被框线遮挡。
+        self.handle_annotation_input(ctx, &response, rect);
+        self.draw_annotations(ui.painter(), rect);
         if self.resizing || self.tex_px != want {
             ctx.request_repaint_after(POLL_INTERVAL);
         }
@@ -1197,6 +1324,10 @@ impl PhotoViewer {
 
     /// 处理画布指针：拖动平移图片，点击文本框弹出文字，点击左右边缘换图。
     fn handle_pointer(&mut self, ctx: &egui::Context, response: &egui::Response, view: egui::Rect) {
+        // 注释模式下一律跳过：不平移、不边缘换图、不弹 OCR 文字框。
+        if self.anno_shape.is_some() {
+            return;
+        }
         let ppp = ctx.pixels_per_point();
         // 拖动平移：只有图片超出视口的轴才能移动。
         if response.dragged() {
@@ -1223,6 +1354,93 @@ impl PhotoViewer {
                 Edge::Right => self.step(1),
                 Edge::None => {}
             }
+        }
+    }
+
+    /// 处理注释绘制：按下记起点，拖动时实时预览，松手落笔。
+    ///
+    /// 只有画布自身的按下才生效：点在浮动窗口上的鼠标不会误触发画布逻辑。
+    fn handle_annotation_input(
+        &mut self,
+        ctx: &egui::Context,
+        response: &egui::Response,
+        rect: egui::Rect,
+    ) {
+        let Some(shape) = self.anno_shape else {
+            return;
+        };
+        // 换图确认框弹出时不接收画布输入。
+        if self.pending_switch.is_some() {
+            return;
+        }
+        let released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+        // 拖动中：终点跟随鼠标并夹在图片区域内。
+        if let Some((start, _)) = self.anno_drag {
+            if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                let end = normalized_point(clamp_into_rect(pos, rect), rect);
+                self.anno_drag = Some((start, end));
+            }
+            if released {
+                self.commit_annotation(shape);
+            }
+            return;
+        }
+        // 新的按下：按下与松开同帧时标记已被清除，用 clicked 兜底。
+        if !response.is_pointer_button_down_on() && !response.clicked() {
+            return;
+        }
+        let Some(pos) = response.interact_pointer_pos() else {
+            return;
+        };
+        if !rect.contains(pos) {
+            // 按在图片外面：直接结束注释模式，不画任何注释。
+            eprintln!("[anno] 图片外按下，结束注释模式");
+            self.anno_shape = None;
+            return;
+        }
+        let start = normalized_point(pos, rect);
+        self.anno_drag = Some((start, start));
+        if released {
+            self.commit_annotation(shape);
+        }
+    }
+
+    /// 落笔：把当前拖拽的图形加入注释列表，并结束注释模式。
+    fn commit_annotation(&mut self, shape: annotation::Shape) {
+        let Some((start, end)) = self.anno_drag.take() else {
+            return;
+        };
+        let anno = annotation::Annotation {
+            shape,
+            color: self.anno_color,
+            width_pct: self.anno_width,
+            start,
+            end,
+        };
+        eprintln!(
+            "[anno] 添加注释: {:?} 颜色 {:?} 粗细 {}%",
+            anno.shape, anno.color, anno.width_pct
+        );
+        self.annotations.push(anno);
+        // 一次只画一条，落笔后需要重新点形状按钮。
+        self.anno_shape = None;
+    }
+
+    /// 在画布上叠加注释：拖拽中的临时图形一并画出，实现实时预览。
+    fn draw_annotations(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if self.annotations.is_empty() && self.anno_drag.is_none() {
+            return;
+        }
+        annotation::paint(painter, &self.annotations, rect);
+        if let (Some(shape), Some((start, end))) = (self.anno_shape, self.anno_drag) {
+            let preview = annotation::Annotation {
+                shape,
+                color: self.anno_color,
+                width_pct: self.anno_width,
+                start,
+                end,
+            };
+            annotation::paint(painter, &[preview], rect);
         }
     }
 
@@ -1302,9 +1520,23 @@ impl PhotoViewer {
                 .on_hover_text("编辑图片");
             if response.clicked() {
                 self.edit_open = !self.edit_open;
-                // 两个浮动窗口都固定在右下角，同时打开会互相遮挡。
+                // 三个浮动窗口都固定在右下角，同时打开会互相遮挡。
                 if self.edit_open {
                     self.settings_open = false;
+                    self.anno_open = false;
+                    self.anno_shape = None;
+                }
+            }
+            let response = icons::button(ui, Icon::Annotate, icons::ICON_SIZE, fg, self.source.is_some())
+                .on_hover_text("注释图片");
+            if response.clicked() {
+                self.anno_open = !self.anno_open;
+                if self.anno_open {
+                    self.settings_open = false;
+                    self.edit_open = false;
+                } else {
+                    // 收起注释窗口即结束注释模式。
+                    self.anno_shape = None;
                 }
             }
             ui.separator();
@@ -1327,9 +1559,11 @@ impl PhotoViewer {
         });
         if toggle_settings {
             self.settings_open = !self.settings_open;
-            // 两个浮动窗口都固定在右下角，同时打开会互相遮挡。
+            // 三个浮动窗口都固定在右下角，同时打开会互相遮挡。
             if self.settings_open {
                 self.edit_open = false;
+                self.anno_open = false;
+                self.anno_shape = None;
             }
         }
     }
@@ -1568,6 +1802,136 @@ impl PhotoViewer {
         }
     }
 
+    /// 注释面板：形状、颜色、粗细与保存操作，样式与编辑图片窗口一致。
+    fn annotation_window(&mut self, ctx: &egui::Context) {
+        if !self.anno_open {
+            return;
+        }
+        let bg = self.settings.background;
+        let fg = bg.foreground();
+        let mut open = self.anno_open;
+        let mut shape = self.anno_shape;
+        let mut color = self.anno_color;
+        let mut width = self.anno_width;
+        let mut auto_save = self.settings.auto_save_annotation;
+        let mut clear = false;
+        let mut save = false;
+        let mut close_clicked = false;
+
+        egui::Window::new("注释")
+            .open(&mut open)
+            .resizable(false)
+            .movable(false)
+            .title_bar(false)
+            .frame(window_frame(ctx, bg))
+            // 固定在右下角，并避开底部控制栏。
+            .anchor(
+                egui::Align2::RIGHT_BOTTOM,
+                egui::vec2(-WINDOW_MARGIN, -(WINDOW_MARGIN + self.controls_height)),
+            )
+            .show(ctx, |ui| {
+                close_clicked = compact_title(ui, "注释", fg);
+                let has_image = self.source.is_some();
+                ui.add_enabled_ui(has_image, |ui| {
+                    // 形状：点一下即进入该形状的注释模式。
+                    ui.horizontal(|ui| {
+                        for option in annotation::Shape::ALL {
+                            if ui.selectable_label(shape == Some(option), option.label()).clicked() {
+                                shape = Some(option);
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        for option in annotation::Color::ALL {
+                            if color_swatch(ui, option, color == option, fg) {
+                                color = option;
+                            }
+                        }
+                    });
+                    ui.label("线条粗细");
+                    ui.add(egui::Slider::new(&mut width, 0.1..=10.0).suffix("%"));
+                    ui.checkbox(&mut auto_save, "切换图片时自动保存");
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("清空注释").clicked() {
+                            clear = true;
+                        }
+                        if ui.button("保存到原图").clicked() {
+                            save = true;
+                        }
+                    });
+                });
+            });
+
+        if close_clicked {
+            open = false;
+        }
+        self.anno_open = open;
+        self.anno_shape = shape;
+        self.anno_color = color;
+        self.anno_width = width;
+        // 窗口收起即结束注释模式，避免残留的形状等待下一次落笔。
+        if !self.anno_open {
+            self.anno_shape = None;
+        }
+        if auto_save != self.settings.auto_save_annotation {
+            self.settings.auto_save_annotation = auto_save;
+            self.settings_dirty = true;
+            eprintln!("[anno] 自动保存 -> {auto_save}");
+        }
+        if clear {
+            self.clear_annotations();
+            self.status = Some("已清空注释".to_string());
+        }
+        if save {
+            self.save_annotations();
+        }
+    }
+
+    /// 换图确认框：提示注释会被清空，由用户决定是否继续换图。
+    fn switch_confirm(&mut self, ctx: &egui::Context) {
+        if self.pending_switch.is_none() {
+            return;
+        }
+        let bg = self.settings.background;
+        let mut cancel = false;
+        let mut confirm = false;
+        let response = egui::Modal::new(egui::Id::unique("anno_switch_confirm"))
+            .frame(window_frame(ctx, bg))
+            .show(ctx, |ui| {
+                ui.label("切换图片会清空当前图片的注释");
+                ui.horizontal(|ui| {
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                    if ui.button("确定").clicked() {
+                        confirm = true;
+                    }
+                });
+            });
+        if cancel {
+            self.pending_switch = None;
+            eprintln!("[anno] 取消换图，保留当前图片的注释");
+            return;
+        }
+        if confirm {
+            let intent = self.pending_switch.take();
+            // 注释先清空，再次换图不会重复弹框。
+            self.clear_annotations();
+            match intent {
+                Some(SwitchIntent::Step(delta)) => self.step(delta),
+                Some(SwitchIntent::Open(path)) => self.open(&path),
+                None => {}
+            }
+            return;
+        }
+        // 点背景或按 Esc 关闭：等同取消。
+        if response.should_close() {
+            self.pending_switch = None;
+            eprintln!("[anno] 关闭确认框，取消换图");
+        }
+    }
+
     /// 右上角文本弹窗：显示选中文本框的内容，并提供复制按钮。
     fn ocr_popup(&mut self, ctx: &egui::Context) {
         if !self.ocr_popup_open {
@@ -1630,6 +1994,10 @@ impl PhotoViewer {
 
     /// 方向键与 PageUp/PageDown 切换图片。
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // 换图确认框弹出时忽略方向键，避免连按连切。
+        if self.pending_switch.is_some() {
+            return;
+        }
         if self.settings_open {
             return;
         }
@@ -1712,7 +2080,10 @@ impl eframe::App for PhotoViewer {
         }
         let _ = self.settings_window(&ctx);
         self.edit_window(&ctx);
+        self.annotation_window(&ctx);
         self.ocr_popup(&ctx);
+        // 换图确认框最后画，保证盖在其它浮动窗口之上。
+        self.switch_confirm(&ctx);
 
         // 设置改动后立刻落盘，避免异常退出丢失。
         if self.settings_dirty {
@@ -1820,6 +2191,45 @@ fn point_in_polygon(pos: egui::Pos2, points: &[egui::Pos2]) -> bool {
         }
     }
     inside
+}
+
+/// 颜色圆圈：实心圆表示颜色，选中时外加一圈描边。
+fn color_swatch(
+    ui: &mut egui::Ui,
+    color: annotation::Color,
+    selected: bool,
+    fg: egui::Color32,
+) -> bool {
+    const SIZE: f32 = 18.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(SIZE, SIZE), egui::Sense::click());
+    let center = rect.center();
+    let radius = SIZE * 0.5 - 2.0;
+    ui.painter().circle_filled(center, radius, color.color());
+    if selected {
+        ui.painter()
+            .circle_stroke(center, radius + 1.5, egui::Stroke::new(1.5, fg));
+    }
+    // 悬浮提示给出颜色名，方便区分相近颜色。
+    response.on_hover_text(color.label()).clicked()
+}
+
+/// 屏幕坐标转图片内的归一化坐标（0~1，原点在左上角）。
+fn normalized_point(pos: egui::Pos2, rect: egui::Rect) -> egui::Vec2 {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return egui::Vec2::ZERO;
+    }
+    egui::vec2(
+        ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0),
+        ((pos.y - rect.min.y) / rect.height()).clamp(0.0, 1.0),
+    )
+}
+
+/// 把屏幕坐标夹回图片区域内。
+fn clamp_into_rect(pos: egui::Pos2, rect: egui::Rect) -> egui::Pos2 {
+    egui::pos2(
+        pos.x.clamp(rect.min.x, rect.max.x),
+        pos.y.clamp(rect.min.y, rect.max.y),
+    )
 }
 
 /// 浮动窗口的外框：底色跟随设置里的背景色。
@@ -2729,6 +3139,112 @@ mod tests {
         let saved = image::open(dir.join("a.png")).unwrap().to_rgba8();
         assert_eq!((saved.width(), saved.height()), (4, 2), "自动保存开启时应改写原图");
         assert!(!app.edit.is_modified());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 建一个两张 8x4 白图的目录，用于注释相关用例。
+    fn anno_fixture(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in ["a.png", "b.png"] {
+            image::RgbaImage::from_pixel(8, 4, image::Rgba([255, 255, 255, 255]))
+                .save(dir.join(file))
+                .unwrap();
+        }
+        dir
+    }
+
+    /// 打开图片并塞入已解码的白底原图，模拟解码完成后的状态。
+    fn opened_anno_app(dir: &Path) -> PhotoViewer {
+        let mut app = PhotoViewer::new();
+        open_and_wait(&mut app, &dir.join("a.png"));
+        app.source = Some(Arc::new(
+            image::RgbaImage::from_pixel(8, 4, image::Rgba([255, 255, 255, 255])),
+        ));
+        app.content_size = [8, 4];
+        app
+    }
+
+    /// 一条盖住左上角的红色矩形注释。
+    fn sample_annotation() -> annotation::Annotation {
+        annotation::Annotation {
+            shape: annotation::Shape::Rect,
+            color: annotation::Color::Red,
+            width_pct: 50.0,
+            start: egui::Vec2::new(0.0, 0.0),
+            end: egui::Vec2::new(0.5, 0.5),
+        }
+    }
+
+    /// 手动保存注释会把注释写进原图并清空注释列表。
+    #[test]
+    fn saving_annotations_writes_them_into_the_original_file() {
+        let dir = anno_fixture("photo-viewer-anno-save-test");
+        let mut app = opened_anno_app(&dir);
+        app.annotations.push(sample_annotation());
+
+        app.save_annotations();
+        assert!(app.annotations.is_empty(), "保存后注释列表应清空");
+        let saved = image::open(dir.join("a.png")).unwrap().to_rgba8();
+        assert_eq!(
+            saved.get_pixel(0, 0).0,
+            [220, 40, 40, 255],
+            "原图应被写入注释"
+        );
+        assert_eq!(
+            saved.get_pixel(7, 3).0,
+            [255, 255, 255, 255],
+            "未覆盖处应保持原样"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 没有注释时保存给出提示，不改动原图。
+    #[test]
+    fn saving_without_annotations_reports_nothing_to_save() {
+        let dir = anno_fixture("photo-viewer-anno-empty-test");
+        let mut app = opened_anno_app(&dir);
+        app.save_annotations();
+        assert_eq!(app.status.as_deref(), Some("没有需要保存的注释"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 有未保存的注释时换图被推迟，注释保留等待确认。
+    #[test]
+    fn switching_with_unsaved_annotations_is_deferred() {
+        let dir = anno_fixture("photo-viewer-anno-defer-test");
+        let mut app = opened_anno_app(&dir);
+        app.settings.auto_save_annotation = false;
+        app.annotations.push(sample_annotation());
+
+        app.step(1);
+        assert_eq!(app.current_name(), "a.png", "有未保存注释时不应直接换图");
+        assert!(app.pending_switch.is_some(), "换图请求应被推迟");
+        assert_eq!(app.annotations.len(), 1, "推迟期间注释应保留");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 自动保存开启时，换图前把注释写回原图再切换。
+    #[test]
+    fn switching_auto_saves_annotations_when_enabled() {
+        let dir = anno_fixture("photo-viewer-anno-autosave-test");
+        let mut app = opened_anno_app(&dir);
+        app.settings.auto_save_annotation = true;
+        app.annotations.push(sample_annotation());
+
+        app.step(1);
+        assert_eq!(app.current_name(), "b.png", "自动保存后应正常换图");
+        assert!(app.annotations.is_empty(), "保存后注释列表应清空");
+        let saved = image::open(dir.join("a.png")).unwrap().to_rgba8();
+        assert_eq!(
+            saved.get_pixel(0, 0).0,
+            [220, 40, 40, 255],
+            "自动保存应把注释写进原图"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

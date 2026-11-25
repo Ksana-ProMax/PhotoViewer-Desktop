@@ -7,6 +7,7 @@
 #[macro_use]
 mod perf;
 
+mod annotation;
 mod console;
 mod editor;
 mod gallery;

@@ -126,6 +126,9 @@ pub struct Settings {
     /// 切换图片时是否自动保存未保存的编辑。
     #[serde(default)]
     pub auto_save_edit: bool,
+    /// 切换图片时是否自动保存未保存的注释。
+    #[serde(default)]
+    pub auto_save_annotation: bool,
     /// 图片与窗口四边的间距（物理像素）。
     #[serde(default)]
     pub padding: u32,
@@ -141,6 +144,7 @@ impl Default for Settings {
             ocr_box_color: BoxColor::Blue,
             ocr_cache_cap: crate::ocr_cache::DEFAULT_CACHE_CAP,
             auto_save_edit: false,
+            auto_save_annotation: false,
             padding: 0,
         }
     }
@@ -211,6 +215,7 @@ mod tests {
         assert_eq!(s.ocr_box_color, BoxColor::Blue);
         assert_eq!(s.ocr_cache_cap, 100);
         assert!(!s.auto_save_edit);
+        assert!(!s.auto_save_annotation);
         assert_eq!(s.padding, 0);
     }
 
