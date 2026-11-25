@@ -163,6 +163,8 @@ pub struct PhotoViewer {
     annotations: Vec<annotation::Annotation>,
     /// 正在拖拽的注释：起点与终点（归一化坐标）。
     anno_drag: Option<(egui::Vec2, egui::Vec2)>,
+    /// 注释绘制日志的指纹：(条数, 图片矩形左上角)，变化时才打印，避免每帧刷屏。
+    anno_log_sig: Option<(usize, [i32; 2])>,
     /// 待确认的换图请求：存在时换图被推迟，等用户点「确定」。
     pending_switch: Option<SwitchIntent>,
 }
@@ -254,6 +256,7 @@ impl PhotoViewer {
             anno_width: 1.0,
             annotations: Vec::new(),
             anno_drag: None,
+            anno_log_sig: None,
             pending_switch: None,
         }
     }
@@ -635,6 +638,7 @@ impl PhotoViewer {
         self.annotations.clear();
         self.anno_shape = None;
         self.anno_drag = None;
+        self.anno_log_sig = None;
     }
 
     /// 换图前的注释处理：无注释直接放行，开启自动保存则先保存，否则推迟等确认。
@@ -1397,7 +1401,7 @@ impl PhotoViewer {
                 self.anno_drag = Some((start, end));
             }
             if released {
-                self.commit_annotation(shape);
+                self.commit_annotation(shape, rect);
             }
             return;
         }
@@ -1417,12 +1421,12 @@ impl PhotoViewer {
         let start = normalized_point(pos, rect);
         self.anno_drag = Some((start, start));
         if released {
-            self.commit_annotation(shape);
+            self.commit_annotation(shape, rect);
         }
     }
 
     /// 落笔：把当前拖拽的图形加入注释列表，并结束注释模式。
-    fn commit_annotation(&mut self, shape: annotation::Shape) {
+    fn commit_annotation(&mut self, shape: annotation::Shape, rect: egui::Rect) {
         let Some((start, end)) = self.anno_drag.take() else {
             return;
         };
@@ -1434,8 +1438,12 @@ impl PhotoViewer {
             end,
         };
         eprintln!(
-            "[anno] 添加注释: {:?} 颜色 {:?} 粗细 {}%",
-            anno.shape, anno.color, anno.width_pct
+            "[anno] 添加注释: {:?} 颜色 {:?} 粗细 {}%，屏幕起点 {:?} 终点 {:?}",
+            anno.shape,
+            anno.color,
+            anno.width_pct,
+            annotation::screen_point(start, rect),
+            annotation::screen_point(end, rect)
         );
         self.annotations.push(anno);
         // 一次只画一条，落笔后需要重新点形状按钮。
@@ -1443,7 +1451,7 @@ impl PhotoViewer {
     }
 
     /// 在画布上叠加注释：拖拽中的临时图形一并画出，实现实时预览。
-    fn draw_annotations(&self, painter: &egui::Painter, rect: egui::Rect) {
+    fn draw_annotations(&mut self, painter: &egui::Painter, rect: egui::Rect) {
         if self.annotations.is_empty() && self.anno_drag.is_none() {
             return;
         }
@@ -1457,6 +1465,28 @@ impl PhotoViewer {
                 end,
             };
             annotation::paint(painter, &[preview], rect);
+        }
+        // 落笔位置日志：打印归一化坐标映射回的屏幕点，
+        // 与鼠标点击位置一致即说明没有错位（仅在条数或图片位置变化时打印）。
+        let sig = (
+            self.annotations.len(),
+            [rect.min.x.round() as i32, rect.min.y.round() as i32],
+        );
+        if self.anno_log_sig != Some(sig) {
+            self.anno_log_sig = Some(sig);
+            let sample = self
+                .annotations
+                .first()
+                .map(|ann| annotation::screen_point(ann.start, rect));
+            eprintln!(
+                "[anno] 叠加绘制 {} 条注释，图片矩形 min=({:.1},{:.1}) size=({:.1},{:.1})，首条起点屏幕坐标 {:?}",
+                self.annotations.len(),
+                rect.min.x,
+                rect.min.y,
+                rect.width(),
+                rect.height(),
+                sample
+            );
         }
     }
 
@@ -2330,6 +2360,33 @@ fn stepper<T: egui::emath::Numeric>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn annotation_is_drawn_at_the_click_position() {
+        // 图片不在屏幕原点时，点击位置与绘制位置必须一致。
+        let rect = egui::Rect::from_min_max(egui::pos2(580.0, 25.0), egui::pos2(1325.0, 930.0));
+        let click = egui::pos2(900.0, 400.0);
+        let norm = normalized_point(click, rect);
+        let drawn = annotation::screen_point(norm, rect);
+        assert!(
+            (drawn - click).length() < 1e-3,
+            "点击位置 {:?} 应与绘制位置 {:?} 一致",
+            click,
+            drawn
+        );
+        let geo = annotation::screen_geometry(
+            annotation::Shape::Rect,
+            norm,
+            norm,
+            rect,
+            2.0,
+        );
+        assert!(
+            (geo.strokes[0][0] - click.to_vec2()).length() < 1e-3,
+            "矩形首点应落在点击位置: {:?}",
+            geo.strokes[0][0]
+        );
+    }
 
     /// 等待后台目录扫描完成。
     fn wait_for_open(app: &mut PhotoViewer) {

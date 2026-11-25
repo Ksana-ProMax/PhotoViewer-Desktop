@@ -208,12 +208,42 @@ pub fn draw_on_image(img: &mut RgbaImage, annotations: &[Annotation]) {
     eprintln!("[anno] 已写入 {} 条注释（{segments} 段描边）", annotations.len());
 }
 
+/// 归一化坐标 → 图片矩形内的屏幕坐标。
+pub fn screen_point(norm: egui::Vec2, rect: egui::Rect) -> egui::Pos2 {
+    egui::pos2(
+        rect.min.x + norm.x * rect.width(),
+        rect.min.y + norm.y * rect.height(),
+    )
+}
+
+/// 计算形状在画布屏幕坐标系下的几何：与 `geometry` 相同，但叠加画布左上角偏移。
+///
+/// 归一化坐标以图片左上角为原点，画布上的图片通常不在屏幕原点，
+/// 因此屏幕坐标必须加上 `rect.min` 才是真正的落笔位置。
+pub fn screen_geometry(
+    shape: Shape,
+    start: egui::Vec2,
+    end: egui::Vec2,
+    rect: egui::Rect,
+    width: f32,
+) -> Geometry {
+    let size = egui::Vec2::new(rect.width(), rect.height());
+    let mut geo = geometry(shape, start, end, size, width);
+    let origin = rect.min.to_vec2();
+    for poly in geo.strokes.iter_mut().chain(geo.fills.iter_mut()) {
+        for point in poly.iter_mut() {
+            *point += origin;
+        }
+    }
+    geo
+}
+
 /// 把注释绘制到画布覆盖层（屏幕坐标）。
 pub fn paint(painter: &egui::Painter, annotations: &[Annotation], rect: egui::Rect) {
     let size = egui::Vec2::new(rect.width(), rect.height());
     for ann in annotations {
         let width = stroke_width(ann.width_pct, size);
-        let geo = geometry(ann.shape, ann.start, ann.end, size, width);
+        let geo = screen_geometry(ann.shape, ann.start, ann.end, rect, width);
         let color = ann.color.color();
         for poly in &geo.strokes {
             painter.add(egui::Shape::line(
@@ -318,6 +348,64 @@ mod tests {
     /// 纯白底图。
     fn solid(w: u32, h: u32) -> RgbaImage {
         RgbaImage::from_pixel(w, h, image::Rgba([255, 255, 255, 255]))
+    }
+
+    #[test]
+    fn screen_geometry_shifts_by_canvas_origin() {
+        // 图片不在屏幕原点时，屏幕几何必须带上画布左上角偏移。
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(580.0, 25.0),
+            egui::pos2(1325.0, 930.0),
+        );
+        let geo = screen_geometry(
+            Shape::Rect,
+            egui::Vec2::new(0.25, 0.5),
+            egui::Vec2::new(0.75, 0.75),
+            rect,
+            2.0,
+        );
+        let pts = &geo.strokes[0];
+        assert!(
+            (pts[0] - egui::Vec2::new(580.0 + 0.25 * 745.0, 25.0 + 0.5 * 905.0)).length() < 1e-3,
+            "屏幕起点应为画布原点加归一化坐标映射: {:?}",
+            pts[0]
+        );
+        assert!(
+            (pts[2] - egui::Vec2::new(580.0 + 0.75 * 745.0, 25.0 + 0.75 * 905.0)).length() < 1e-3,
+            "屏幕终点应同步偏移: {:?}",
+            pts[2]
+        );
+    }
+
+    #[test]
+    fn screen_geometry_keeps_relative_offsets_of_local_geometry() {
+        let rect = egui::Rect::from_min_max(egui::pos2(100.0, 50.0), egui::pos2(500.0, 350.0));
+        let size = egui::Vec2::new(rect.width(), rect.height());
+        let local = geometry(
+            Shape::Arrow,
+            egui::Vec2::new(0.1, 0.2),
+            egui::Vec2::new(0.9, 0.8),
+            size,
+            3.0,
+        );
+        let screen = screen_geometry(
+            Shape::Arrow,
+            egui::Vec2::new(0.1, 0.2),
+            egui::Vec2::new(0.9, 0.8),
+            rect,
+            3.0,
+        );
+        let origin = rect.min.to_vec2();
+        for (a, b) in local.strokes.iter().zip(screen.strokes.iter()) {
+            for (pa, pb) in a.iter().zip(b.iter()) {
+                assert!(((*pb - origin) - *pa).length() < 1e-3, "偏移应为纯平移");
+            }
+        }
+        for (a, b) in local.fills.iter().zip(screen.fills.iter()) {
+            for (pa, pb) in a.iter().zip(b.iter()) {
+                assert!(((*pb - origin) - *pa).length() < 1e-3, "偏移应为纯平移");
+            }
+        }
     }
 
     #[test]
