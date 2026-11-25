@@ -256,14 +256,22 @@ impl Loader {
                         if *loaded_token != token || *loaded_version != version {
                             continue;
                         }
+                        eprintln!(
+                            "[scale] {}x{} -> {}x{} {}",
+                            src.width(),
+                            src.height(),
+                            px[0],
+                            px[1],
+                            scale_filter_name(src, px)
+                        );
                         let resized = {
-                            perf_scope!(format!("缩放 {}x{}", px[0], px[1]));
-                            image::imageops::resize(
-                                src.as_ref(),
-                                px[0] as u32,
-                                px[1] as u32,
-                                FilterType::CatmullRom,
-                            )
+                            perf_scope!(format!(
+                                "缩放 {}x{} {}",
+                                px[0],
+                                px[1],
+                                scale_filter_name(src, px)
+                            ));
+                            scale_image(src, px)
                         };
                         let _ = msg_tx.send(Msg::Resized {
                             token,
@@ -356,6 +364,30 @@ fn decode(path: &PathBuf) -> Result<RgbaImage, String> {
         .decode()
         .map(|img| img.to_rgba8())
         .map_err(|err| format!("解码失败: {err}"))
+}
+
+/// 缩到比原图小才用盒式平均：尺寸不变或放大都不适用。
+fn is_downscale(src: &RgbaImage, px: [usize; 2]) -> bool {
+    px[0] < src.width() as usize && px[1] < src.height() as usize
+}
+
+/// 缩放方式的名字，写进日志便于确认实际走了哪条路径。
+fn scale_filter_name(src: &RgbaImage, px: [usize; 2]) -> &'static str {
+    if is_downscale(src, px) {
+        "盒式"
+    } else {
+        "CatmullRom"
+    }
+}
+
+/// 缩放到目标像素：缩小时用盒式平均（不混叠且快得多），放大时保留 CatmullRom。
+fn scale_image(src: &RgbaImage, px: [usize; 2]) -> RgbaImage {
+    let (width, height) = (px[0] as u32, px[1] as u32);
+    if is_downscale(src, px) {
+        image::imageops::thumbnail(src, width, height)
+    } else {
+        image::imageops::resize(src, width, height, FilterType::CatmullRom)
+    }
 }
 
 /// 文件名，用于日志；取不到时退回完整路径。
@@ -493,5 +525,26 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 缩小走盒式平均，尺寸不变或放大保留 CatmullRom。
+    #[test]
+    fn scale_filter_switches_on_direction() {
+        let src = image::RgbaImage::new(100, 80);
+        assert!(is_downscale(&src, [50, 40]), "两轴都变小应算缩小");
+        assert!(!is_downscale(&src, [100, 80]), "同尺寸不算缩小");
+        assert!(!is_downscale(&src, [200, 160]), "放大不算缩小");
+        assert!(!is_downscale(&src, [50, 160]), "单轴放大不适用盒式");
+        assert_eq!(scale_filter_name(&src, [50, 40]), "盒式");
+        assert_eq!(scale_filter_name(&src, [200, 160]), "CatmullRom");
+    }
+
+    /// 缩放结果尺寸与请求一致，颜色取自原图。
+    #[test]
+    fn scale_image_keeps_requested_size() {
+        let src = image::RgbaImage::from_pixel(40, 30, image::Rgba([10, 20, 30, 255]));
+        let scaled = scale_image(&src, [10, 8]);
+        assert_eq!((scaled.width(), scaled.height()), (10, 8));
+        assert_eq!(scaled.get_pixel(0, 0).0, [10, 20, 30, 255]);
     }
 }

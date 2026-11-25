@@ -707,21 +707,21 @@ impl PhotoViewer {
         }
     }
 
-    /// 前后切换同目录图片：到首尾就停住，不循环。
-    fn step(&mut self, delta: i32) {
+    /// 前后切换同目录图片：到首尾就停住，不循环。返回是否真的换了图。
+    fn step(&mut self, delta: i32) -> bool {
         perf_scope!("切换图片");
         if self.gallery.len() < 2 {
-            return;
+            return false;
         }
         // 识别进行中禁止换图，避免结果与当前图片错位。
         if self.ocr_running {
             eprintln!("[switch] 识别进行中，忽略换图请求");
-            return;
+            return false;
         }
         let len = self.gallery.len() as i32;
         // 换图前先处理未保存的注释：有注释时按设置自动保存或推迟等确认。
         if !self.prepare_switch(SwitchIntent::Step(delta)) {
-            return;
+            return false;
         }
         // 换图前先处理未保存的编辑。
         self.finish_edits();
@@ -734,7 +734,7 @@ impl PhotoViewer {
                 self.gallery.len(),
                 self.current_name()
             );
-            return;
+            return false;
         }
         self.index = next as usize;
         eprintln!(
@@ -744,6 +744,7 @@ impl PhotoViewer {
             self.current_name()
         );
         self.load_current();
+        true
     }
 
     /// 当前图片的文件名，用于日志与状态栏。
@@ -1213,7 +1214,7 @@ impl PhotoViewer {
                 ctx.request_repaint_after(POLL_INTERVAL);
             }
             // 画面为空时只处理指针：这里没有内容尺寸，不会发纹理请求。
-            self.handle_pointer(ctx, &response, view);
+            let _ = self.handle_pointer(ctx, &response, view);
             return;
         };
 
@@ -1234,7 +1235,7 @@ impl PhotoViewer {
         self.normalize_pan_drag();
         self.pan = self.image_pan();
         self.log_fit_state();
-        self.handle_pointer(ctx, &response, view);
+        let switched = self.handle_pointer(ctx, &response, view);
 
         let max_side = ctx.input(|i| i.max_texture_side);
         let target = geometry::scale_px(content, self.zoom_target, max_side);
@@ -1242,7 +1243,16 @@ impl PhotoViewer {
             target[0].round().max(1.0) as usize,
             target[1].round().max(1.0) as usize,
         ];
-        self.ensure_texture(want, self.zoom_manual);
+        // 换图后画面已清空，本帧的内容尺寸已作废：再按它请求纹理会多生成一张
+        // 无人观看的全分辨率纹理，换图因此慢上半秒。改为等新图就绪后再请求。
+        if switched {
+            eprintln!(
+                "[texture] 换图后跳过本帧纹理请求（原内容 {}x{}）",
+                content[0], content[1]
+            );
+        } else {
+            self.ensure_texture(want, self.zoom_manual);
+        }
 
         let rect = egui::Rect::from_center_size(view.center() + self.pan, self.view_image_size);
         self.image_rect = rect;
@@ -1322,11 +1332,16 @@ impl PhotoViewer {
         })
     }
 
-    /// 处理画布指针：拖动平移图片，点击文本框弹出文字，点击左右边缘换图。
-    fn handle_pointer(&mut self, ctx: &egui::Context, response: &egui::Response, view: egui::Rect) {
+    /// 处理画布指针：拖动平移图片，点击文本框弹出文字，点击左右边缘换图。返回是否换了图。
+    fn handle_pointer(
+        &mut self,
+        ctx: &egui::Context,
+        response: &egui::Response,
+        view: egui::Rect,
+    ) -> bool {
         // 注释模式下一律跳过：不平移、不边缘换图、不弹 OCR 文字框。
         if self.anno_shape.is_some() {
-            return;
+            return false;
         }
         let ppp = ctx.pixels_per_point();
         // 拖动平移：只有图片超出视口的轴才能移动。
@@ -1345,16 +1360,17 @@ impl PhotoViewer {
                 self.ocr_selected = Some(index);
                 self.ocr_popup_open = true;
                 eprintln!("[ocr] 选中文本框 #{index}");
-                return;
+                return false;
             }
             self.ocr_selected = None;
             self.ocr_popup_open = false;
-            match edge_of(view, pos, ppp) {
+            return match edge_of(view, pos, ppp) {
                 Edge::Left => self.step(-1),
                 Edge::Right => self.step(1),
-                Edge::None => {}
-            }
+                Edge::None => false,
+            };
         }
+        false
     }
 
     /// 处理注释绘制：按下记起点，拖动时实时预览，松手落笔。
@@ -1919,7 +1935,9 @@ impl PhotoViewer {
             // 注释先清空，再次换图不会重复弹框。
             self.clear_annotations();
             match intent {
-                Some(SwitchIntent::Step(delta)) => self.step(delta),
+                Some(SwitchIntent::Step(delta)) => {
+                    self.step(delta);
+                }
                 Some(SwitchIntent::Open(path)) => self.open(&path),
                 None => {}
             }
@@ -2586,6 +2604,17 @@ mod tests {
     fn run_canvas(app: &mut PhotoViewer, width: f32, height: f32, events: Vec<egui::Event>) {
         let ctx = egui::Context::default();
         ctx.set_fonts(egui::FontDefinitions::empty());
+        run_canvas_ctx(app, &ctx, width, height, events);
+    }
+
+    /// 复用同一个上下文跑一帧画布：跨帧的指针状态才能延续。
+    fn run_canvas_ctx(
+        app: &mut PhotoViewer,
+        ctx: &egui::Context,
+        width: f32,
+        height: f32,
+        events: Vec<egui::Event>,
+    ) {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -2633,6 +2662,16 @@ mod tests {
         }
     }
 
+    /// 左键按下或抬起的事件。
+    fn pointer_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
     /// 真实画布路径：缩放到 100% 后换图，新图按自己的适配比例显示。
     #[test]
     fn canvas_restores_fit_zoom_after_switching() {
@@ -2674,6 +2713,69 @@ mod tests {
         );
         assert!((app.zoom - 100.0).abs() > 1.0, "新图不应沿用上一张的 100%");
         assert_eq!(app.zoom_target, app.zoom);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 边缘点击换图：本帧不能再按旧尺寸请求纹理，否则会多生成一张全分辨率纹理。
+    #[test]
+    fn edge_click_switch_skips_stale_texture_request() {
+        let dir = std::env::temp_dir().join("photo-viewer-edge-click-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a.png", "b.png"] {
+            image::RgbaImage::new(4, 4).save(dir.join(name)).unwrap();
+        }
+
+        let mut app = PhotoViewer::new();
+        open_and_wait(&mut app, &dir.join("a.png"));
+        // 模拟解码完成：a.png 是一张大图。
+        app.source = Some(Arc::new(image::RgbaImage::new(2000, 1500)));
+        app.content_size = [2000, 1500];
+
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::empty());
+        // 先跑一帧让画布登记交互区：egui 的点击命中用的是上一帧的部件矩形。
+        run_canvas_ctx(&mut app, &ctx, 800.0, 600.0, Vec::new());
+        // 右边缘感应区内的按下与抬起。
+        let pos = egui::pos2(797.0, 300.0);
+        run_canvas_ctx(
+            &mut app,
+            &ctx,
+            800.0,
+            600.0,
+            vec![pointer_button(pos, true)],
+        );
+        run_canvas_ctx(
+            &mut app,
+            &ctx,
+            800.0,
+            600.0,
+            vec![pointer_button(pos, false)],
+        );
+
+        assert_eq!(app.current_name(), "b.png", "边缘点击应换到下一张");
+        assert!(
+            app.want_px.is_none(),
+            "换图当帧不应按旧尺寸请求纹理，实际请求 {:?}",
+            app.want_px
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 换图结果只报告真正换图的情况：边界与识别中都不算。
+    #[test]
+    fn step_reports_whether_image_changed() {
+        let dir = std::env::temp_dir().join("photo-viewer-step-report-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a.png", "b.png"] {
+            image::RgbaImage::new(4, 4).save(dir.join(name)).unwrap();
+        }
+
+        let mut app = PhotoViewer::new();
+        open_and_wait(&mut app, &dir.join("a.png"));
+        assert!(app.step(1), "正常换图应报告成功");
+        assert!(!app.step(1), "末图停留应报告未换图");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
